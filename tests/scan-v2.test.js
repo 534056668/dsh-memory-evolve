@@ -5,8 +5,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  analyze, candidatePairs, detectIdRefs, detectRefArchived, detectStale, detectTopicPairs,
-  main, parseMemoryText, renderMarkdown, scanDir, toolIdOf,
+  analyze, analyzeWithEmbeddings, candidatePairs, detectIdRefs, detectRefArchived, detectStale,
+  detectTopicPairs, embeddingPairs, main, mergeEmbPairs, parseMemoryText, renderMarkdown, scanDir,
+  toolIdOf,
 } from '../skills/memory-consolidate/scripts/scan_memory.mjs'
 
 // v2（档1 改造，2026-10-31）新增契约：工具 id 一致 / 确定性通道 / 稀疏候选 / 体检单渲染。
@@ -109,3 +110,79 @@ test('main CLI：--md 落盘（v2 新增）', () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── v3（档2 语义通道）────────────────────────────────────────────────────────
+
+const unit = (vals) => {
+  const n = Math.sqrt(vals.reduce((a, b) => a + b * b, 0)) || 1
+  return vals.map((v) => v / n)
+}
+
+test('embeddingPairs：双档阈值把候选分成 emb / emb-weak，并按相似度截断', () => {
+  // 三条向量：0↔1 完全同向（sim=1），0↔2 约 0.8，1↔2 也约 0.8
+  const v0 = unit([1, 0, 0])
+  const v1 = unit([1, 0, 0])
+  const v2 = unit([1, 0.75, 0]) // 与 v0/v1 的余弦 ≈ 0.8
+  const entries = [{ body: 'a' }, { body: 'b' }, { body: 'c' }]
+  const hi = embeddingPairs(entries, [v0, v1, v2], { hi: 0.9, lo: 0.7, maxPairs: 0 })
+  assert.equal(hi.total, 3)
+  const byPair = new Map(hi.pairs.map((p) => [`${p.i}-${p.j}`, p]))
+  assert.deepEqual(byPair.get('0-1').reasons, ['emb'])
+  assert.deepEqual(byPair.get('0-2').reasons, ['emb-weak'])
+  assert.ok(byPair.get('0-1').sim > byPair.get('0-2').sim)
+  // 截断：只保留最相似的前 1 对
+  const capped = embeddingPairs(entries, [v0, v1, v2], { hi: 0.9, lo: 0.7, maxPairs: 1 })
+  assert.equal(capped.pairs.length, 1)
+  assert.equal(capped.pairs[0].reasons[0], 'emb')
+  // lo 抬到 0.99：只剩完全同向的 0-1（sim=1），0-2/1-2 被滤掉
+  const strict = embeddingPairs(entries, [v0, v1, v2], { hi: 0.9, lo: 0.99 })
+  assert.equal(strict.pairs.length, 1)
+  assert.deepEqual([strict.pairs[0].i, strict.pairs[0].j, strict.pairs[0].reasons[0]], [0, 1, 'emb'])
+  // 缺失向量（null）不参与比较：只剩 0-2 一对，且没有任何一对涉及下标 1
+  const partial = embeddingPairs(entries, [v0, null, v2], { hi: 0.9, lo: 0.7 })
+  assert.equal(partial.pairs.length, 1)
+  assert.deepEqual([partial.pairs[0].i, partial.pairs[0].j], [0, 2])
+})
+
+test('mergeEmbPairs：同一对合并 reason 取较大 sim，新对计入 added', () => {
+  const base = [{ i: 0, j: 1, sim: 0.5, reasons: ['similar'] }]
+  const emb = [
+    { i: 0, j: 1, sim: 0.88, reasons: ['emb'] },
+    { i: 1, j: 2, sim: 0.79, reasons: ['emb-weak'] },
+  ]
+  const out = mergeEmbPairs(base, emb)
+  assert.equal(out.pairs.length, 2)
+  assert.equal(out.added, 1)
+  const merged = out.pairs.find((p) => p.i === 0 && p.j === 1)
+  assert.deepEqual(merged.reasons, ['similar', 'emb'])
+  assert.equal(merged.sim, 0.88)
+  // 顺序无关（i/j 归一）
+  const swapped = mergeEmbPairs([{ i: 1, j: 0, sim: 0.5, reasons: ['similar'] }], [{ i: 0, j: 1, sim: 0.9, reasons: ['emb'] }])
+  assert.equal(swapped.pairs.length, 1)
+  assert.equal(swapped.added, 0)
+})
+
+test('analyzeWithEmbeddings：ollama 不可达时优雅降级为纯词法，且不抛异常', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scan-embed-'))
+  try {
+    writeFileSync(join(dir, 'MEMORY.md'), [
+      '[2026-09-01] 旧结论：收益几乎全来自日内',
+      '[2026-10-01] 订正：实测收益几乎全来自隔夜',
+      '[2026-10-02] 完全无关的一条：ETF 池设计与调仓周期',
+    ].join('\n§\n') + '\n')
+    const scanned = scanDir(dir)
+    const base = analyze(scanned, {})
+    const res = await analyzeWithEmbeddings(scanned, { ollamaUrl: 'http://127.0.0.1:1' })
+    assert.equal(res.embed.ok, false)
+    assert.match(res.embed.reason, /不可达|模型未安装|HTTP/)
+    // 降级后簇数量与纯词法一致
+    assert.equal(res.clusters.length, base.clusters.length)
+    assert.equal(res.stats.entries, base.stats.entries)
+    // 报告里能渲染出「跳过」原因
+    const md = renderMarkdown({ ...res, dir, stats: { files: 1, ...res.stats }, channelStats: res.channelStats }, { top: 5 })
+    assert.match(md, /语义通道：\*\*跳过\*\*/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+

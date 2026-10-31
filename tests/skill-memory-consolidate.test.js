@@ -171,9 +171,20 @@ test('main CLI：报告落盘、统计正确；参数错误与目录错误有明
 })
 
 test('parseArgs：合法参数、缺省值与非法输入', () => {
-  assert.deepEqual(parseArgs([]), { dir: null, out: null, md: null, threshold: 0.42, top: 40, includeProjectLog: false, staleDays: 60 })
-  assert.deepEqual(parseArgs(['--dir', 'd', '--out', 'o', '--threshold', '0.6']),
-    { dir: 'd', out: 'o', md: null, threshold: 0.6, top: 40, includeProjectLog: false, staleDays: 60 })
+  const defaults = {
+    dir: null, out: null, md: null, threshold: 0.42, top: 40, includeProjectLog: false, staleDays: 60,
+    embed: null, embedHi: 0.82, embedLo: 0.75, embedCache: null, embedBatch: 16, embedMaxPairs: 300,
+    ollamaUrl: 'http://127.0.0.1:11434',
+  }
+  assert.deepEqual(parseArgs([]), defaults)
+  assert.deepEqual(parseArgs(['--dir', 'd', '--out', 'o', '--threshold', '0.6']), { ...defaults, dir: 'd', out: 'o', threshold: 0.6 })
+  // --embed 不带值 → 默认模型；带值 → 指定模型
+  assert.equal(parseArgs(['--embed']).embed, 'qwen3-embedding:0.6b')
+  assert.equal(parseArgs(['--embed', 'qwen3-embedding:4b']).embed, 'qwen3-embedding:4b')
+  assert.equal(parseArgs(['--embed', '--top', '3']).embed, 'qwen3-embedding:0.6b')
+  assert.equal(parseArgs(['--embed', '--top', '3']).top, 3)
+  assert.throws(() => parseArgs(['--embed-hi', '1.5']))
+  assert.throws(() => parseArgs(['--embed-hi', '0.5', '--embed-lo', '0.9']), /embed-lo/)
   assert.throws(() => parseArgs(['--bogus']))
   assert.throws(() => parseArgs(['--threshold', 'abc']))
   assert.throws(() => parseArgs(['--threshold', '1.5']))

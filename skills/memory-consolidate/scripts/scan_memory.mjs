@@ -23,9 +23,9 @@
  * 退出码：0 正常 / 2 参数错误 / 3 目录不可用
  */
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const ENTRY_DELIMITER = '\n§\n'
@@ -38,7 +38,14 @@ const USAGE = `usage: node scan_memory.mjs [options]
   --threshold <0..1>      cosine similarity floor for "similar" candidates (default: 0.42)
   --top <N>               markdown 里最多列多少簇 (default 40, 0=全部)
   --include-project-log   把项目日志轨（project-log）也放进聚类
-  --stale-days <N>        「状态词 + 陈旧」的年龄门槛，天 (default 60)`
+  --stale-days <N>        「状态词 + 陈旧」的年龄门槛，天 (default 60)
+  --embed [model]         开启语义通道（本地 ollama /api/embed；默认 qwen3-embedding:0.6b）
+  --embed-hi <0..1>       语义高置信阈值，≥此值记 emb（默认 0.82）
+  --embed-lo <0..1>       语义待判阈值，≥此值记 emb-weak（默认 0.75）
+  --embed-cache <path>    向量缓存文件（默认 ~/.cache/dsh-memory-evolve/embed-<model>.json）
+  --embed-batch <N>       每批送几条（默认 16）
+  --embed-max-pairs <N>   语义候选对上限，按相似度取前 N（默认 300，0=不限）
+  --ollama <url>          ollama 地址（默认 http://127.0.0.1:11434）`
 
 // ── 解析 ────────────────────────────────────────────────────────────────────
 
@@ -285,8 +292,8 @@ export function candidatePairs(entries, opts = {}) {
 
 // ── 聚类 ────────────────────────────────────────────────────────────────────
 
-const HINT_PRIORITY = ['idref', 'supersede', 'duplicate', 'conflict', 'topic', 'idref-weak', 'cite', 'similar']
-const HINT_SCORE = { idref: 100, supersede: 90, duplicate: 70, conflict: 60, topic: 50, 'idref-weak': 40, cite: 45, similar: 30 }
+const HINT_PRIORITY = ['idref', 'supersede', 'duplicate', 'conflict', 'topic', 'emb', 'idref-weak', 'cite', 'emb-weak', 'similar']
+const HINT_SCORE = { idref: 100, supersede: 90, duplicate: 70, conflict: 60, topic: 50, emb: 55, 'idref-weak': 40, cite: 45, 'emb-weak': 35, similar: 30 }
 /** 不进候选的 reasons（只统计数量）：related = 纯「相关/参考」引用。 */
 const SKIP_REASONS = new Set(['related'])
 
@@ -671,6 +678,202 @@ export function analyze(scanned, opts = {}) {
   }
 }
 
+// ── 语义通道（v3 档2：本地 ollama embedding）──────────────────────────────
+
+export const EMBED_DEFAULTS = {
+  model: 'qwen3-embedding:0.6b',
+  hi: 0.82,
+  lo: 0.75,
+  batch: 16,
+  maxPairs: 300,
+  url: 'http://127.0.0.1:11434',
+  timeoutMs: 120000,
+}
+
+const sha1Short = (s) => createHash('sha1').update(String(s)).digest('hex').slice(0, 16)
+
+function defaultEmbedCache(model) {
+  const safe = String(model).replace(/[^a-zA-Z0-9._-]/g, '_')
+  return join(homedir(), '.cache', 'dsh-memory-evolve', `embed-${safe}.json`)
+}
+
+/** 探测 ollama：可达 + 模型是否已装。任何异常都返回 {ok:false}，绝不抛。 */
+export async function probeOllama(url = EMBED_DEFAULTS.url, model = EMBED_DEFAULTS.model) {
+  try {
+    const res = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(3000) })
+    if (!res.ok) return { ok: false, reason: `ollama /api/tags HTTP ${res.status}` }
+    const j = await res.json()
+    const names = (j.models || []).map((m) => m.name)
+    const has = names.some((n) => n === model || n.startsWith(model + ':') || n.split(':')[0] === model.split(':')[0])
+    if (!has) return { ok: false, reason: `模型未安装（先跑 ollama pull ${model}）`, names }
+    return { ok: true, names }
+  } catch (err) {
+    return { ok: false, reason: `ollama 不可达：${err?.message ?? err}` }
+  }
+}
+
+async function embedBatch(url, model, texts, timeoutMs) {
+  const res = await fetch(`${url}/api/embed`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model, input: texts }),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!res.ok) throw new Error(`/api/embed HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`)
+  const j = await res.json()
+  if (!Array.isArray(j.embeddings) || j.embeddings.length !== texts.length) {
+    throw new Error('embedding 数量与输入不匹配')
+  }
+  return j.embeddings
+}
+
+/**
+ * 计算（或复用缓存）每条条目的向量。按正文 sha1 前 16 位做键，
+ * 因此只有新增/改写的条目会真正送模型（增量）。
+ */
+export async function embedEntries(entries, opts = {}) {
+  const model = opts.model ?? EMBED_DEFAULTS.model
+  const url = opts.url ?? EMBED_DEFAULTS.url
+  const batch = Math.max(1, opts.batch ?? EMBED_DEFAULTS.batch)
+  const timeoutMs = opts.timeoutMs ?? EMBED_DEFAULTS.timeoutMs
+  const cacheFile = opts.cacheFile ?? defaultEmbedCache(model)
+  const probe = await probeOllama(url, model)
+  if (!probe.ok) return { ok: false, reason: probe.reason, model, vectors: null, embedded: 0, cached: 0 }
+  let cache = { model, dim: null, items: {} }
+  if (existsSync(cacheFile)) {
+    try {
+      const c = JSON.parse(readFileSync(cacheFile, 'utf8'))
+      if (c && c.model === model && c.items && typeof c.items === 'object') cache = c
+    } catch { /* 缓存损坏 → 当作空缓存重建 */ }
+  }
+  const hashes = entries.map((en) => sha1Short(en.body))
+  const pending = []
+  const queued = new Set()
+  hashes.forEach((h, i) => {
+    if (!cache.items[h] && !queued.has(h)) { queued.add(h); pending.push(i) }
+  })
+  let embedded = 0
+  for (let k = 0; k < pending.length; k += batch) {
+    const idxs = pending.slice(k, k + batch)
+    const texts = idxs.map((i) => String(entries[i].body ?? '').slice(0, 2000))
+    const vecs = await embedBatch(url, model, texts, timeoutMs)
+    idxs.forEach((i, t) => { cache.items[hashes[i]] = vecs[t] })
+    if (vecs[0]) cache.dim = vecs[0].length
+    embedded += idxs.length
+  }
+  if (embedded > 0) {
+    try {
+      mkdirSync(dirname(cacheFile), { recursive: true })
+      writeFileSync(cacheFile, JSON.stringify(cache), 'utf8')
+    } catch { /* 缓存写失败不影响本次结果 */ }
+  }
+  const vectors = hashes.map((h) => cache.items[h] ?? null)
+  return { ok: true, model, dim: cache.dim, vectors, embedded, cached: entries.length - embedded, cacheFile }
+}
+
+/** 全对余弦 → 语义候选对（hi 以上记 emb，lo~hi 记 emb-weak），按相似度截断。 */
+export function embeddingPairs(entries, vectors, opts = {}) {
+  const hi = opts.hi ?? EMBED_DEFAULTS.hi
+  const lo = opts.lo ?? EMBED_DEFAULTS.lo
+  const maxPairs = opts.maxPairs ?? EMBED_DEFAULTS.maxPairs
+  const idx = []
+  vectors.forEach((v, i) => { if (Array.isArray(v) && v.length) idx.push(i) })
+  const norms = new Map()
+  for (const i of idx) {
+    const v = vectors[i]
+    let s = 0
+    for (let k = 0; k < v.length; k++) s += v[k] * v[k]
+    norms.set(i, Math.sqrt(s) || 1)
+  }
+  const out = []
+  for (let a = 0; a < idx.length; a++) {
+    const i = idx[a]
+    const vi = vectors[i]
+    for (let b = a + 1; b < idx.length; b++) {
+      const j = idx[b]
+      const vj = vectors[j]
+      const n = Math.min(vi.length, vj.length)
+      let dot = 0
+      for (let k = 0; k < n; k++) dot += vi[k] * vj[k]
+      const sim = dot / (norms.get(i) * norms.get(j))
+      if (sim < lo) continue
+      out.push({ i, j, sim, reasons: [sim >= hi ? 'emb' : 'emb-weak'] })
+    }
+  }
+  out.sort((x, y) => y.sim - x.sim)
+  return { pairs: maxPairs > 0 ? out.slice(0, maxPairs) : out, total: out.length, hi, lo, maxPairs }
+}
+
+/** 把语义候选对并入既有对集合（同 key 补 reason 取较大 sim）。 */
+export function mergeEmbPairs(pairs, embPairs) {
+  const key = (p) => Math.min(p.i, p.j) * 1048576 + Math.max(p.i, p.j)
+  const map = new Map(pairs.map((p) => [key(p), { ...p, reasons: [...p.reasons] }]))
+  let added = 0
+  for (const p of embPairs) {
+    const k = key(p)
+    const cur = map.get(k)
+    if (cur) {
+      for (const r of p.reasons) if (!cur.reasons.includes(r)) cur.reasons.push(r)
+      cur.sim = Math.max(cur.sim ?? 0, p.sim)
+    } else {
+      map.set(k, { i: p.i, j: p.j, sim: p.sim, reasons: [...p.reasons], note: null })
+      added++
+    }
+  }
+  return { pairs: [...map.values()], added }
+}
+
+/** 词法通道 + 语义通道。ollama 不可用时自动降级为纯词法（embed.ok=false 并带原因）。 */
+export async function analyzeWithEmbeddings(scanned, opts = {}) {
+  const base = analyze(scanned, opts)
+  const live = base.live
+  let emb
+  try {
+    emb = await embedEntries(live, {
+      model: opts.embedModel ?? EMBED_DEFAULTS.model,
+      url: opts.ollamaUrl ?? EMBED_DEFAULTS.url,
+      batch: opts.embedBatch,
+      cacheFile: opts.embedCache,
+      timeoutMs: opts.embedTimeoutMs,
+    })
+  } catch (err) {
+    return { ...base, embed: { ok: false, reason: `语义通道异常：${err?.message ?? err}`, model: opts.embedModel ?? EMBED_DEFAULTS.model } }
+  }
+  if (!emb.ok) {
+    return { ...base, embed: { ok: false, reason: emb.reason, model: emb.model ?? (opts.embedModel ?? EMBED_DEFAULTS.model) } }
+  }
+  const ep = embeddingPairs(live, emb.vectors, {
+    hi: opts.embedHi ?? EMBED_DEFAULTS.hi,
+    lo: opts.embedLo ?? EMBED_DEFAULTS.lo,
+    maxPairs: opts.embedMaxPairs ?? EMBED_DEFAULTS.maxPairs,
+  })
+  const merged = mergeEmbPairs(base.pairs, ep.pairs)
+  const clusters = rankClusters(buildClusters(live, merged.pairs))
+  const hints = {}
+  for (const c of clusters) hints[c.hint] = (hints[c.hint] || 0) + 1
+  return {
+    ...base,
+    pairs: merged.pairs,
+    clusters,
+    embed: {
+      ok: true,
+      model: emb.model,
+      dim: emb.dim,
+      embedded: emb.embedded,
+      cached: emb.cached,
+      pairsHi: ep.pairs.filter((p) => p.reasons.includes('emb')).length,
+      pairsLo: ep.pairs.filter((p) => p.reasons.includes('emb-weak')).length,
+      pairsTotal: ep.total,
+      maxPairs: ep.maxPairs,
+      hi: ep.hi,
+      lo: ep.lo,
+      added: merged.added,
+    },
+    channelStats: { ...base.channelStats, emb: ep.pairs.length },
+    stats: { ...base.stats, clusters: clusters.length, hints, pairs: merged.pairs.length },
+  }
+}
+
 const ACTION_BY_HINT = {
   idref: '一条正文引用了另一条的 id → 必看：确认现行结论是哪条，旧条归档并在保留条内注明关系',
   supersede: '覆盖更新 → 保留较新/有实证的一条（旧条独有细节并进去），旧条归档',
@@ -678,6 +881,8 @@ const ACTION_BY_HINT = {
   conflict: '冲突 → 以有实证、日期更新的一方为准，被否定说法归档，保留条内注明订正关系',
   topic: '同题跨期多结论 → 核对是否同一结论的多个版本；被推翻的旧条归档并注明',
   'idref-weak': '正文提到对方 id 但无明确覆盖措辞 → 扫一眼：确认是否同一件事的两个版本',
+  emb: '语义高度相近（≥高置信阈值）→ 大概率同题不同版本：确认哪条是现行结论，旧条归档并在保留条内注明',
+  'emb-weak': '语义相近但未达高置信 → 先看两者是否同一件事；「同主题不同事实」不要合并',
   cite: '引用了对方原文片段 → 确认引用是否仍有效（被引用条若已归档，需更新引用）',
   similar: '相近 → 确认是否同一事项；「同主题不同事实」不要合并',
 }
@@ -695,15 +900,23 @@ export function renderMarkdown(report, opts = {}) {
   L.push(`- 参与聚类：${report.stats.entries} 条（扫描 ${report.stats.entriesScanned}，排除 ${report.stats.excluded}）`)
   L.push(`- 分轨：${Object.entries(report.stats.byTrack).map(([k, v]) => `${k}=${v}`).join('  ')}`)
   L.push(`- 候选簇：${report.stats.clusters}（列出 ${clusters.length}）｜条目对 ${report.stats.pairs}｜陈旧 ${report.stats.stale}｜引用已归档 ${report.stats.refArchived}`)
-  L.push(`- 通道：idref=${h.idref || 0} supersede=${h.supersede || 0} duplicate=${h.duplicate || 0} conflict=${h.conflict || 0} topic=${h.topic || 0} cite=${h.cite || 0} similar=${h.similar || 0}`)
+  L.push(`- 通道：idref=${h.idref || 0} supersede=${h.supersede || 0} duplicate=${h.duplicate || 0} conflict=${h.conflict || 0} topic=${h.topic || 0} emb=${h.emb || 0} cite=${h.cite || 0} emb-weak=${h['emb-weak'] || 0} similar=${h.similar || 0}`)
+  const emb = report.embed
+  if (emb) {
+    L.push(emb.ok
+      ? `- 语义通道：${emb.model}（${emb.dim} 维｜新算 ${emb.embedded} / 复用 ${emb.cached}｜高置信 ${emb.pairsHi} 对 / 待判 ${emb.pairsLo} 对，取自 ${emb.pairsTotal} 对前 ${emb.maxPairs}｜阈值 ${emb.hi}/${emb.lo}）`
+      : `- 语义通道：**跳过**（${emb.reason}）`)
+  } else {
+    L.push('- 语义通道：未启用（加 --embed 开启本地 ollama 语义候选）')
+  }
   L.push(`- 耗时：${(report.stats.elapsedMs / 1000).toFixed(1)} 秒`)
   L.push('')
   L.push('> 只读产出：脚本不改任何记忆文件；执行一律用 memory 工具的 archive（可逆），禁止直接编辑 .md。')
   L.push('')
   const sections = [
     ['第一档 · 必看（id 互引 / 覆盖更新）', ['idref', 'supersede']],
-    ['第二档 · 可看（重复 / 冲突 / 同题跨期）', ['duplicate', 'conflict', 'topic']],
-    ['第三档 · 扫一眼（弱 id 引用 / 引用片段 / 相近）', ['idref-weak', 'cite', 'similar']],
+    ['第二档 · 可看（重复 / 冲突 / 同题跨期 / 语义高置信）', ['duplicate', 'conflict', 'topic', 'emb']],
+    ['第三档 · 扫一眼（弱 id 引用 / 引用片段 / 语义待判 / 相近）', ['idref-weak', 'cite', 'emb-weak', 'similar']],
   ]
   for (const [title, hints] of sections) {
     const list = clusters.filter((c) => hints.includes(c.hint))
@@ -770,7 +983,11 @@ export function renderMarkdown(report, opts = {}) {
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 export function parseArgs(argv) {
-  const opts = { dir: null, out: null, md: null, threshold: 0.42, top: 40, includeProjectLog: false, staleDays: 60 }
+  const opts = {
+    dir: null, out: null, md: null, threshold: 0.42, top: 40, includeProjectLog: false, staleDays: 60,
+    embed: null, embedHi: 0.82, embedLo: 0.75, embedCache: null, embedBatch: 16, embedMaxPairs: 300,
+    ollamaUrl: EMBED_DEFAULTS.url,
+  }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--dir') opts.dir = argv[++i]
@@ -780,6 +997,17 @@ export function parseArgs(argv) {
     else if (a === '--top') opts.top = Number(argv[++i])
     else if (a === '--stale-days') opts.staleDays = Number(argv[++i])
     else if (a === '--include-project-log') opts.includeProjectLog = true
+    else if (a === '--embed') {
+      // 允许 --embed 后面不带值（用默认模型），也允许显式指定模型名
+      const next = argv[i + 1]
+      if (next && !String(next).startsWith('--')) { opts.embed = String(next); i++ } else opts.embed = EMBED_DEFAULTS.model
+    }
+    else if (a === '--embed-hi') opts.embedHi = Number(argv[++i])
+    else if (a === '--embed-lo') opts.embedLo = Number(argv[++i])
+    else if (a === '--embed-cache') opts.embedCache = argv[++i]
+    else if (a === '--embed-batch') opts.embedBatch = Number(argv[++i])
+    else if (a === '--embed-max-pairs') opts.embedMaxPairs = Number(argv[++i])
+    else if (a === '--ollama') opts.ollamaUrl = String(argv[++i])
     else throw new Error(`unknown arg: ${a}`)
   }
   if (!Number.isFinite(opts.threshold) || opts.threshold <= 0 || opts.threshold >= 1) {
@@ -787,6 +1015,12 @@ export function parseArgs(argv) {
   }
   if (!Number.isFinite(opts.top) || opts.top < 0) throw new Error('--top must be a number >= 0')
   if (!Number.isFinite(opts.staleDays) || opts.staleDays < 0) throw new Error('--stale-days must be a number >= 0')
+  if (opts.embed != null && opts.embed !== EMBED_DEFAULTS.model && typeof opts.embed !== 'string') throw new Error('--embed requires a model name')
+  if (!Number.isFinite(opts.embedHi) || opts.embedHi <= 0 || opts.embedHi > 1) throw new Error('--embed-hi must be a number in (0, 1]')
+  if (!Number.isFinite(opts.embedLo) || opts.embedLo <= 0 || opts.embedLo > 1) throw new Error('--embed-lo must be a number in (0, 1]')
+  if (opts.embedLo > opts.embedHi) throw new Error('--embed-lo must be <= --embed-hi')
+  if (!Number.isFinite(opts.embedBatch) || opts.embedBatch < 1) throw new Error('--embed-batch must be a number >= 1')
+  if (!Number.isFinite(opts.embedMaxPairs) || opts.embedMaxPairs < 0) throw new Error('--embed-max-pairs must be a number >= 0')
   if (opts.dir != null && typeof opts.dir !== 'string') throw new Error('--dir requires a path')
   if (opts.out != null && typeof opts.out !== 'string') throw new Error('--out requires a path')
   if (opts.md != null && typeof opts.md !== 'string') throw new Error('--md requires a path')
@@ -810,17 +1044,33 @@ export function main(argv = []) {
     return 3
   }
   const scanned = scanDir(dir)
-  const result = analyze(scanned, {
+  const analyzeOpts = {
     threshold: opts.threshold,
     excludeTracks: opts.includeProjectLog ? [] : DEFAULT_EXCLUDE_TRACKS,
     staleDays: opts.staleDays,
-  })
+    embedModel: opts.embed,
+    embedHi: opts.embedHi,
+    embedLo: opts.embedLo,
+    embedCache: opts.embedCache,
+    embedBatch: opts.embedBatch,
+    embedMaxPairs: opts.embedMaxPairs,
+    ollamaUrl: opts.ollamaUrl,
+  }
+  if (opts.embed) {
+    // 语义通道要调 ollama → 异步；返回 Promise，由 CLI 尾部 await
+    return analyzeWithEmbeddings(scanned, analyzeOpts).then((result) => finishReport(opts, dir, scanned, result))
+  }
+  return finishReport(opts, dir, scanned, analyze(scanned, analyzeOpts))
+}
+
+function finishReport(opts, dir, scanned, result) {
   const report = {
     generatedAt: new Date().toISOString(),
-    version: 2,
+    version: 3,
     dir,
     threshold: opts.threshold,
     excludeTracks: opts.includeProjectLog ? [] : DEFAULT_EXCLUDE_TRACKS,
+    embed: result.embed ?? null,
     stats: { files: scanned.filesScanned.length, ...result.stats },
     channelStats: result.channelStats,
     clusters: result.clusters,
@@ -835,7 +1085,12 @@ export function main(argv = []) {
     console.log(`  dir: ${dir}`)
     console.log(`  entries: ${report.stats.entries} clustered (scanned ${report.stats.entriesScanned}, excluded ${report.stats.excluded})`)
     console.log(`  clusters: ${report.stats.clusters}`)
-    console.log(`  hints: idref=${h.idref || 0} supersede=${h.supersede || 0} duplicate=${h.duplicate || 0} conflict=${h.conflict || 0} topic=${h.topic || 0} cite=${h.cite || 0} similar=${h.similar || 0}`)
+    console.log(`  hints: idref=${h.idref || 0} supersede=${h.supersede || 0} duplicate=${h.duplicate || 0} conflict=${h.conflict || 0} topic=${h.topic || 0} emb=${h.emb || 0} cite=${h.cite || 0} emb-weak=${h['emb-weak'] || 0} similar=${h.similar || 0}`)
+    if (report.embed) {
+      console.log(report.embed.ok
+        ? `  embed: ${report.embed.model} dim=${report.embed.dim} embedded=${report.embed.embedded} cached=${report.embed.cached} hi=${report.embed.pairsHi} lo=${report.embed.pairsLo} (of ${report.embed.pairsTotal}, kept ${report.embed.maxPairs})`
+        : `  embed: skipped (${report.embed.reason})`)
+    }
     console.log(`  signals: stale=${report.stats.stale} refArchived=${report.stats.refArchived}`)
     console.log(`  elapsed: ${(report.stats.elapsedMs / 1000).toFixed(1)}s`)
     if (opts.out) console.log(`  report: ${opts.out}`)
@@ -853,4 +1108,14 @@ const isDirectRun = Boolean(process.argv[1]) && (() => {
     return false
   }
 })()
-if (isDirectRun) process.exitCode = main(process.argv.slice(2))
+if (isDirectRun) {
+  const ret = main(process.argv.slice(2))
+  if (ret && typeof ret.then === 'function') {
+    ret.then((code) => { process.exitCode = code }).catch((err) => {
+      console.error(`[memory-consolidate] ${err?.stack ?? err}`)
+      process.exitCode = 1
+    })
+  } else {
+    process.exitCode = ret
+  }
+}
