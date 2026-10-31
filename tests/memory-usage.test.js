@@ -178,6 +178,19 @@ test('工具层端到端：定向查询记命中、expand 记 expanded、快照�
     assert.equal(rec.expanded, 1, 'expand 记一次')
     assert.equal(rec.hits, 1, 'expand 同时算一次命中')
 
+    // 全局轨（memory）的 expand 必须同等记账：只记 key 会让占注入量约七成的长期
+    // 记忆轨展开率恒为 0，从而把"没记账"误读成"没人展开"。
+    // 用从未被查过的那条（双低策略）做断言，避免与上面的命中计数串味
+    const memTarget = raw.find((x) => x.includes('双低策略'))
+    assert.ok(memTarget, '找到未被查询过的 memory 条目')
+    const memId = extractEntryId(memTarget) ?? legacyIdFor(memTarget)
+    const expMem = await tool.execute({ action: 'expand', target: 'memory', id: memId }, exec())
+    assert.equal(expMem.ok, true)
+    flushUsage()
+    const recMem = usageOf(dir).entries[usageKey('memory', memTarget)]
+    assert.equal(recMem.expanded, 1, 'memory 轨 expand 也记 expanded')
+    assert.equal(recMem.hits, 1, 'memory 轨 expand 同时算一次命中')
+
     // 快照注入 → injects（三条轨各记）
     const snap = ctx.state.contexts.find((c) => c.name === 'memory:snapshot')
     snap.text({ agent })

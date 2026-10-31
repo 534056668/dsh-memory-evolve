@@ -7,7 +7,9 @@
  *
  * 读 `<memoryDir>/usage.json`（由 lib/memory-usage.js 写入），输出：
  *   ① 覆盖率（多少条目进过注入、多少被定向查过）
- *   ② 「反复注入但从未被查过」——注入预算化（C）的第一批候选
+ *   ② 「反复注入但从未被查过」——**不是删除建议**：检索本身是罕见行为，"从未
+ *      被查"是绝大多数条目的默认状态，用它当删除依据会误杀。本表只用来观察
+ *      「注入量 vs 检索需求」的量级对比，不构成任何条目该删的结论。
  *   ③ 「被查过最多的条目」
  *   ④ 「被查过但没进注入」（= 靠检索取回，说明注入可以省）
  *   ⑤ 「从未被触及」
@@ -91,7 +93,8 @@ console.log('')
 console.log('## 覆盖率')
 console.log('进过注入: ' + rows.filter((r) => r.injects > 0).length + ' / ' + rows.length + '　被定向查过: ' + rows.filter((r) => r.hits > 0).length + ' / ' + rows.length + '（其中 expand 过 ' + rows.filter((r) => r.expanded > 0).length + ' 条）')
 console.log('')
-console.log('## 反复注入但从未被查过（C 的第一批候选，共 ' + injectedNeverQueried.length + ' 条，按注入次数降序取前 ' + top + '）')
+console.log('## 反复注入但从未被查过（共 ' + injectedNeverQueried.length + ' 条，按注入次数降序取前 ' + top + '）')
+console.log('# 注意：本表不是删除建议。检索是罕见行为，"从未被查"是默认状态；只能用来对比注入量与检索需求的量级。')
 console.log('injects    hits   exp  lastRetrieved         条目')
 for (const r of injectedNeverQueried.slice(0, top)) console.log(line(r))
 console.log('')
