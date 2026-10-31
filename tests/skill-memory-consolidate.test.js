@@ -171,9 +171,9 @@ test('main CLI：报告落盘、统计正确；参数错误与目录错误有明
 })
 
 test('parseArgs：合法参数、缺省值与非法输入', () => {
-  assert.deepEqual(parseArgs([]), { dir: null, out: null, threshold: 0.42 })
+  assert.deepEqual(parseArgs([]), { dir: null, out: null, md: null, threshold: 0.42, top: 40, includeProjectLog: false, staleDays: 60 })
   assert.deepEqual(parseArgs(['--dir', 'd', '--out', 'o', '--threshold', '0.6']),
-    { dir: 'd', out: 'o', threshold: 0.6 })
+    { dir: 'd', out: 'o', md: null, threshold: 0.6, top: 40, includeProjectLog: false, staleDays: 60 })
   assert.throws(() => parseArgs(['--bogus']))
   assert.throws(() => parseArgs(['--threshold', 'abc']))
   assert.throws(() => parseArgs(['--threshold', '1.5']))

@@ -62,12 +62,22 @@ skills/memory-consolidate` 与用户技能根 `~/.agents/skills/memory-consolida
 然后只读扫描：
 
 ```bash
-node <技能目录>/scripts/scan_memory.mjs --dir <memoryDir> --out <工作区>/memory-consolidate-report.json
+node <技能目录>/scripts/scan_memory.mjs --dir <memoryDir> \
+  --out <工作区>/memory-consolidate-report.json \
+  --md <工作区>/记忆体检-YYYYMMDD.md
 ```
 
 - `<memoryDir>` 缺省 `~/.dsh/memories`；`--threshold` 缺省 0.42（相似候选门槛）。
-- 报告 JSON：候选簇（members/pairs/hint）+ 统计；`hint` 只是**建议**（supersede /
-  duplicate / conflict / similar），最终定性以第二步的裁决为准。
+- **v2（2026-10-31）默认不聚类项目日志轨**（project-log 是编年史，条目最多、噪声最大；
+  需要时加 `--include-project-log`）。日志轨仍被读入，用于「引用了已归档条目」检测。
+- `--md` 出人可读体检单（三档分级 + 每条附可复制的 `match` 片段），`--top` 控簇数
+  （缺省 40），`--stale-days` 控陈旧门槛（缺省 60 天）。
+- 报告里的条目 id 是 **memory 工具的短 id**（与 `lib/sync/entryid.js` 的 legacyIdFor
+  同规则），可直接用于 `memory action=expand id=<id>`。
+- 报告 JSON：候选簇（members/pairs/hint）+ 单条信号（stale / refArchived）+ 统计；
+  `hint` 只是**建议**（idref / supersede / duplicate / conflict / topic / cite /
+  similar），最终定性以第二步的裁决为准。**idref 已按引用语境分类**：`订正 xxx`=覆盖类，
+  `参考 xxx`=关联类（脚本已剔除，不进报告）。
 - **脚本不可用时的回退**：用 memory 工具 `list` 分轨分批读取全部条目，由 AI 直接做
   相近判读（条目量大时按轨道与项目分组逐批处理）。
 
