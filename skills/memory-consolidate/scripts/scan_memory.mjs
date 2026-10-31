@@ -296,6 +296,8 @@ const HINT_PRIORITY = ['idref', 'supersede', 'duplicate', 'conflict', 'topic', '
 const HINT_SCORE = { idref: 100, supersede: 90, duplicate: 70, conflict: 60, topic: 50, emb: 55, 'idref-weak': 40, cite: 45, 'emb-weak': 35, similar: 30 }
 /** 不进候选的 reasons（只统计数量）：related = 纯「相关/参考」引用。 */
 const SKIP_REASONS = new Set(['related'])
+/** 允许被「簇大小上限」丢弃的软边（确定性通道的边一律保留）。 */
+const SOFT_REASONS = new Set(['emb', 'emb-weak', 'similar'])
 
 /** v1 兼容：全对比较 + 并查集聚簇。 */
 export function clusterEntries(entries, opts = {}) {
@@ -312,6 +314,42 @@ export function clusterEntries(entries, opts = {}) {
     }
   }
   return buildClusters(entries, pairs)
+}
+
+/**
+ * 连通分量过大会把无关主题串成一串（传递闭包爆炸）：A~B、B~C、C~D 会把 A 和 D 并进
+ * 同一簇。按 sim 从低到高逐条丢边，直到每个分量成员数 ≤ maxSize。
+ */
+export function limitClusterSize(entries, pairs, maxSize = 8) {
+  if (!(maxSize > 0) || pairs.length === 0) return pairs
+  const current = pairs.slice()
+  for (let guard = 0; guard < 20000; guard++) {
+    const parent = entries.map((_, i) => i)
+    const find = (x) => {
+      while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x] }
+      return x
+    }
+    for (const p of current) parent[find(p.i)] = find(p.j)
+    const groups = new Map()
+    current.forEach((p, idx) => {
+      const root = find(p.i)
+      if (!groups.has(root)) groups.set(root, [])
+      groups.get(root).push(idx)
+    })
+    // 只允许丢「软边」（语义/相近）；idref/supersede/conflict/duplicate/topic/cite 是确定性
+    // 证据，丢了就再也看不到，宁可让该簇保持超限。
+    let worst = null
+    for (const idxs of groups.values()) {
+      if (idxs.length + 1 <= maxSize) continue
+      const soft = idxs.filter((k) => current[k].reasons.every((r) => SOFT_REASONS.has(r)))
+      if (!soft.length) continue
+      const cand = soft.reduce((a, b) => (current[a].sim <= current[b].sim ? a : b))
+      if (worst == null || current[cand].sim < current[worst].sim) worst = cand
+    }
+    if (worst == null) return current
+    current.splice(worst, 1)
+  }
+  return current
 }
 
 export function buildClusters(entries, pairs) {
@@ -645,7 +683,8 @@ export function analyze(scanned, opts = {}) {
       push(p)
     }
   }
-  const pairs = [...merged.values()]
+  const pairsRaw = [...merged.values()]
+  const pairs = limitClusterSize(live, pairsRaw, opts.maxClusterSize ?? 8)
   const clusters = rankClusters(buildClusters(live, pairs))
   const stale = detectStale(live, { days: opts.staleDays ?? 60, now: opts.now })
   const refArchived = detectRefArchived(live, scanned.archivedEntries)
@@ -671,6 +710,7 @@ export function analyze(scanned, opts = {}) {
       clusters: clusters.length,
       hints,
       pairs: pairs.length,
+      pairsDropped: pairsRaw.length - pairs.length,
       stale: stale.length,
       refArchived: refArchived.length,
       elapsedMs,
@@ -847,8 +887,12 @@ export async function analyzeWithEmbeddings(scanned, opts = {}) {
     lo: opts.embedLo ?? EMBED_DEFAULTS.lo,
     maxPairs: opts.embedMaxPairs ?? EMBED_DEFAULTS.maxPairs,
   })
-  const merged = mergeEmbPairs(base.pairs, ep.pairs)
-  const clusters = rankClusters(buildClusters(live, merged.pairs))
+  // 只有高置信 emb 参与成簇；emb-weak 只作为「待判对」单独列出（并进簇会因传递闭包炸成大簇）
+  const embStrong = ep.pairs.filter((p) => p.reasons.includes('emb'))
+  const embWeak = ep.pairs.filter((p) => !p.reasons.includes('emb'))
+  const merged = mergeEmbPairs(base.pairs, embStrong)
+  const capped = limitClusterSize(live, merged.pairs, opts.maxClusterSize ?? 8)
+  const clusters = rankClusters(buildClusters(live, capped))
   const hints = {}
   for (const c of clusters) hints[c.hint] = (hints[c.hint] || 0) + 1
   return {
@@ -868,9 +912,22 @@ export async function analyzeWithEmbeddings(scanned, opts = {}) {
       hi: ep.hi,
       lo: ep.lo,
       added: merged.added,
+      weakPairs: embWeak.slice(0, opts.weakPairsLimit ?? 40).map((p) => ({
+        a: live[p.i].toolId || live[p.i].id,
+        b: live[p.j].toolId || live[p.j].id,
+        sim: Math.round(p.sim * 1000) / 1000,
+        aTitle: titleOf(live[p.i]).slice(0, 40),
+        bTitle: titleOf(live[p.j]).slice(0, 40),
+      })),
     },
-    channelStats: { ...base.channelStats, emb: ep.pairs.length },
-    stats: { ...base.stats, clusters: clusters.length, hints, pairs: merged.pairs.length },
+    channelStats: { ...base.channelStats, emb: embStrong.length, 'emb-weak': embWeak.length },
+    stats: {
+      ...base.stats,
+      clusters: clusters.length,
+      hints,
+      pairs: capped.length,
+      pairsDropped: (base.stats.pairsDropped ?? 0) + (merged.pairs.length - capped.length),
+    },
   }
 }
 
@@ -913,6 +970,17 @@ export function renderMarkdown(report, opts = {}) {
   L.push('')
   L.push('> 只读产出：脚本不改任何记忆文件；执行一律用 memory 工具的 archive（可逆），禁止直接编辑 .md。')
   L.push('')
+  const weak = report.embed?.ok ? (report.embed.weakPairs || []) : []
+  if (weak.length) {
+    L.push(`## 语义待判对（未成簇，按相似度取前 ${weak.length}）`)
+    L.push('')
+    L.push('> 这些对没到高置信阈值，不成簇；逐对判断「同一件事的两个版本」还是「同主题不同事实」。')
+    L.push('')
+    for (const p of weak) {
+      L.push(`- sim ${p.sim}｜[${p.a}] ${p.aTitle}  ⟷  [${p.b}] ${p.bTitle}`)
+    }
+    L.push('')
+  }
   const sections = [
     ['第一档 · 必看（id 互引 / 覆盖更新）', ['idref', 'supersede']],
     ['第二档 · 可看（重复 / 冲突 / 同题跨期 / 语义高置信）', ['duplicate', 'conflict', 'topic', 'emb']],

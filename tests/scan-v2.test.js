@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   analyze, analyzeWithEmbeddings, candidatePairs, detectIdRefs, detectRefArchived, detectStale,
-  detectTopicPairs, embeddingPairs, main, mergeEmbPairs, parseMemoryText, renderMarkdown, scanDir,
-  toolIdOf,
+  detectTopicPairs, embeddingPairs, limitClusterSize, main, mergeEmbPairs, parseMemoryText,
+  renderMarkdown, scanDir, toolIdOf,
 } from '../skills/memory-consolidate/scripts/scan_memory.mjs'
 
 // v2（档1 改造，2026-10-31）新增契约：工具 id 一致 / 确定性通道 / 稀疏候选 / 体检单渲染。
@@ -186,3 +186,33 @@ test('analyzeWithEmbeddings：ollama 不可达时优雅降级为纯词法，且�
   }
 })
 
+
+test('limitClusterSize：传递闭包炸簇时按 sim 从低到高丢软边，确定性边永不丢', () => {
+  const entries = Array.from({ length: 6 }, (_, i) => ({ id: 'e' + i, body: 'x' + i, track: 'memory' }))
+  // 链：0-1(0.90) 1-2(0.88) 2-3(0.86) 3-4(0.50) → 一条 5 成员的大分量
+  const chain = [
+    { i: 0, j: 1, sim: 0.9, reasons: ['emb'] },
+    { i: 1, j: 2, sim: 0.88, reasons: ['emb'] },
+    { i: 2, j: 3, sim: 0.86, reasons: ['emb'] },
+    { i: 3, j: 4, sim: 0.5, reasons: ['similar'] },
+  ]
+  const capped = limitClusterSize(entries, chain, 3)
+  // 最弱那条（0.50）先被丢，剩下 0-1-2-3 仍是 4 成员 → 再丢 0.86
+  assert.equal(capped.length, 2)
+  assert.deepEqual(capped.map((p) => p.sim), [0.9, 0.88])
+  const groups = new Map()
+  for (const p of capped) groups.set(p.i, (groups.get(p.i) ?? 0) + 1)
+  // 每条剩余边都属于 ≤3 成员的分量
+  assert.ok(capped.every((p) => p.sim >= 0.88))
+  // 不超限时原样返回
+  assert.equal(limitClusterSize(entries, chain, 10).length, 4)
+  // 确定性边（idref）即使 sim 最低也不会被丢
+  const mixed = [
+    { i: 0, j: 1, sim: 0.95, reasons: ['emb'] },
+    { i: 1, j: 2, sim: 0.94, reasons: ['emb'] },
+    { i: 2, j: 3, sim: 0.1, reasons: ['idref'] },
+    { i: 3, j: 4, sim: 0.93, reasons: ['emb'] },
+  ]
+  const kept = limitClusterSize(entries, mixed, 3)
+  assert.ok(kept.some((p) => p.reasons.includes('idref')), 'idref 边必须保留')
+})
