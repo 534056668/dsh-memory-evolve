@@ -78,8 +78,11 @@ node <技能目录>/scripts/scan_memory.mjs --dir <memoryDir> \
   `hint` 只是**建议**（idref / supersede / duplicate / conflict / topic / cite /
   similar），最终定性以第二步的裁决为准。**idref 已按引用语境分类**：`订正 xxx`=覆盖类，
   `参考 xxx`=关联类（脚本已剔除，不进报告）。
-- **语义通道（v3 / 档2，可选）**：加 `--embed` 走本地 ollama 语义候选（默认
-  `qwen3-embedding:0.6b`，可用 `--embed <模型>` 指定）。它补的是词法的盲区：
+- **语义通道（v3 / 档2，可选）**：加 `--embed` 走本地 ollama 语义候选。**不带值时按
+  `EMBED_MODEL_CHAIN` 自动挑**：先试 `qwen3-embedding-4b-local`（分离度更好，本机推荐），
+  不可用再回退 `qwen3-embedding:0.6b`（体积小、可移植），全不可用则降级为纯词法并在报告写明
+  原因；`--embed <模型>` 可钉死某个模型（此时不自动换，缺模型就如实报错）。报告里
+  `embed.auto=true` 表示模型是自动挑的。它补的是词法的盲区：
   「同一件事换了措辞」的条目字面重合度低，词法通道会漏。实测（712 条真实记忆）：
   - 12 对已知真值对里，词法通道漏掉 6 对（措辞不同的同题/撤回），语义通道 **12/12 全中**；
   - 阈值双档：`--embed-hi 0.82` 记 `emb`（高置信，实测该档抽样全是真重复/版本对），

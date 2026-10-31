@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   ENTRY_DELIMITER, clusterEntries, computeIdf, cosine, diceBigrams, entryTerms,
-  fnv1a32, main, normText, pairReasons, parseArgs, parseMemoryText, quotedRefersTo, scanDir, stripHeaderComment,
+  fnv1a32, main, normText, pairReasons, parseArgs, parseMemoryText, quotedRefersTo, resolveEmbedModel,
+  scanDir, stripHeaderComment, EMBED_MODEL_CHAIN,
 } from '../skills/memory-consolidate/scripts/scan_memory.mjs'
 
 // memory-consolidate 内置技能的预扫脚本：解析 / 相似度 / 候选理由 / 聚类 /
@@ -178,10 +179,10 @@ test('parseArgs：合法参数、缺省值与非法输入', () => {
   }
   assert.deepEqual(parseArgs([]), defaults)
   assert.deepEqual(parseArgs(['--dir', 'd', '--out', 'o', '--threshold', '0.6']), { ...defaults, dir: 'd', out: 'o', threshold: 0.6 })
-  // --embed 不带值 → 默认模型；带值 → 指定模型
-  assert.equal(parseArgs(['--embed']).embed, 'qwen3-embedding:0.6b')
+  // --embed 不带值 → true（按 EMBED_MODEL_CHAIN 自动挑）；带值 → 钉死该模型
+  assert.equal(parseArgs(['--embed']).embed, true)
   assert.equal(parseArgs(['--embed', 'qwen3-embedding:4b']).embed, 'qwen3-embedding:4b')
-  assert.equal(parseArgs(['--embed', '--top', '3']).embed, 'qwen3-embedding:0.6b')
+  assert.equal(parseArgs(['--embed', '--top', '3']).embed, true)
   assert.equal(parseArgs(['--embed', '--top', '3']).top, 3)
   assert.throws(() => parseArgs(['--embed-hi', '1.5']))
   assert.throws(() => parseArgs(['--embed-hi', '0.5', '--embed-lo', '0.9']), /embed-lo/)
@@ -196,4 +197,35 @@ test('工具函数：normText / diceBigrams 基本行为', () => {
   assert.equal(diceBigrams('完全不同', 'xyz'), 0)
   assert.equal(ENTRY_DELIMITER, '\n§\n')
   assert.ok(!existsSync(join(tmpdir(), 'memscan-nonexistent')))
+})
+
+test('resolveEmbedModel：显式模型不偷换、自动模式按链取首个可用、全不可用降级', async () => {
+  const mk = (okSet) => async (_url, model) => (okSet.includes(model)
+    ? { ok: true, names: okSet }
+    : { ok: false, reason: '模型未安装' })
+
+  // 1) 自动模式：链首 4B 可用 → 选 4B，auto=true
+  const a = await resolveEmbedModel({ probe: mk([EMBED_MODEL_CHAIN[0]]) })
+  assert.equal(a.model, EMBED_MODEL_CHAIN[0])
+  assert.equal(a.ok, true)
+  assert.equal(a.auto, true)
+
+  // 2) 自动模式：只有链尾 0.6B → 回退到它
+  const b = await resolveEmbedModel({ probe: mk([EMBED_MODEL_CHAIN[1]]) })
+  assert.equal(b.model, EMBED_MODEL_CHAIN[1])
+  assert.equal(b.ok, true)
+
+  // 3) 显式指定但没装 → 不偷偷换成别的模型，如实报原因
+  const c = await resolveEmbedModel({ preferred: 'nope:1b', probe: mk([EMBED_MODEL_CHAIN[0]]) })
+  assert.equal(c.model, 'nope:1b')
+  assert.equal(c.ok, false)
+  assert.equal(c.auto, false)
+  assert.match(c.reason, /未安装/)
+
+  // 4) 全不可用 → 降级信号（ok=false）+ 链首占位 + 原因含两个候选
+  const d = await resolveEmbedModel({ probe: mk([]) })
+  assert.equal(d.ok, false)
+  assert.equal(d.model, EMBED_MODEL_CHAIN[0])
+  assert.match(d.reason, /无可用嵌入模型/)
+  assert.match(d.reason, /qwen3-embedding-4b-local/)
 })

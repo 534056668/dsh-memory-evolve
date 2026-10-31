@@ -730,6 +730,30 @@ export const EMBED_DEFAULTS = {
   timeoutMs: 120000,
 }
 
+// 未显式指定模型时的探测顺序：本机优先 4B（分离度更好），缺失则回退 0.6B（体积小、可移植）。
+export const EMBED_MODEL_CHAIN = ['qwen3-embedding-4b-local', 'qwen3-embedding:0.6b']
+
+/**
+ * 决定本次用哪个嵌入模型。
+ * - preferred 给定：只探测它，不可用就如实报原因（不偷偷换模型，避免与用户预期不符）；
+ * - preferred 为空：按 EMBED_MODEL_CHAIN 顺序探测，取第一个可用的（auto=true）；
+ * - 全部不可用：返回链首 + 原因，由调用方降级为纯词法。
+ * probe 可注入（测试用），缺省走真实 probeOllama。
+ */
+export async function resolveEmbedModel({ url = EMBED_DEFAULTS.url, preferred = null, probe = probeOllama } = {}) {
+  if (preferred) {
+    const p = await probe(url, preferred)
+    return { model: preferred, ok: p.ok, reason: p.ok ? null : p.reason, auto: false }
+  }
+  const tried = []
+  for (const m of EMBED_MODEL_CHAIN) {
+    const p = await probe(url, m)
+    if (p.ok) return { model: m, ok: true, reason: null, auto: true }
+    tried.push(`${m}（${p.reason}）`)
+  }
+  return { model: EMBED_MODEL_CHAIN[0], ok: false, reason: `无可用嵌入模型：${tried.join('；')}`, auto: true }
+}
+
 const sha1Short = (s) => createHash('sha1').update(String(s)).digest('hex').slice(0, 16)
 
 function defaultEmbedCache(model) {
@@ -867,11 +891,16 @@ export function mergeEmbPairs(pairs, embPairs) {
 export async function analyzeWithEmbeddings(scanned, opts = {}) {
   const base = analyze(scanned, opts)
   const live = base.live
+  const url = opts.ollamaUrl ?? EMBED_DEFAULTS.url
+  const picked = await resolveEmbedModel({ url, preferred: opts.embedModel ?? null, probe: opts.embedProbe })
+  if (!picked.ok) {
+    return { ...base, embed: { ok: false, reason: picked.reason, model: picked.model, auto: picked.auto } }
+  }
   let emb
   try {
     emb = await embedEntries(live, {
-      model: opts.embedModel ?? EMBED_DEFAULTS.model,
-      url: opts.ollamaUrl ?? EMBED_DEFAULTS.url,
+      model: picked.model,
+      url,
       batch: opts.embedBatch,
       cacheFile: opts.embedCache,
       timeoutMs: opts.embedTimeoutMs,
@@ -902,6 +931,7 @@ export async function analyzeWithEmbeddings(scanned, opts = {}) {
     embed: {
       ok: true,
       model: emb.model,
+      auto: picked.auto,
       dim: emb.dim,
       embedded: emb.embedded,
       cached: emb.cached,
@@ -1068,7 +1098,8 @@ export function parseArgs(argv) {
     else if (a === '--embed') {
       // 允许 --embed 后面不带值（用默认模型），也允许显式指定模型名
       const next = argv[i + 1]
-      if (next && !String(next).startsWith('--')) { opts.embed = String(next); i++ } else opts.embed = EMBED_DEFAULTS.model
+      // 不带值 = true → 按 EMBED_MODEL_CHAIN 自动挑（本机优先 4B）；带值 = 钉死该模型
+      if (next && !String(next).startsWith('--')) { opts.embed = String(next); i++ } else opts.embed = true
     }
     else if (a === '--embed-hi') opts.embedHi = Number(argv[++i])
     else if (a === '--embed-lo') opts.embedLo = Number(argv[++i])
@@ -1083,7 +1114,7 @@ export function parseArgs(argv) {
   }
   if (!Number.isFinite(opts.top) || opts.top < 0) throw new Error('--top must be a number >= 0')
   if (!Number.isFinite(opts.staleDays) || opts.staleDays < 0) throw new Error('--stale-days must be a number >= 0')
-  if (opts.embed != null && opts.embed !== EMBED_DEFAULTS.model && typeof opts.embed !== 'string') throw new Error('--embed requires a model name')
+  if (opts.embed != null && opts.embed !== true && typeof opts.embed !== 'string') throw new Error('--embed requires a model name')
   if (!Number.isFinite(opts.embedHi) || opts.embedHi <= 0 || opts.embedHi > 1) throw new Error('--embed-hi must be a number in (0, 1]')
   if (!Number.isFinite(opts.embedLo) || opts.embedLo <= 0 || opts.embedLo > 1) throw new Error('--embed-lo must be a number in (0, 1]')
   if (opts.embedLo > opts.embedHi) throw new Error('--embed-lo must be <= --embed-hi')
@@ -1116,7 +1147,7 @@ export function main(argv = []) {
     threshold: opts.threshold,
     excludeTracks: opts.includeProjectLog ? [] : DEFAULT_EXCLUDE_TRACKS,
     staleDays: opts.staleDays,
-    embedModel: opts.embed,
+    embedModel: opts.embed === true ? null : opts.embed,
     embedHi: opts.embedHi,
     embedLo: opts.embedLo,
     embedCache: opts.embedCache,
