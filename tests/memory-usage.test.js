@@ -8,8 +8,9 @@ import { MemoryStore } from '../lib/store.js'
 import { extractEntryId, legacyIdFor } from '../lib/sync/entryid.js'
 import { apply } from '../lib/index.js'
 import {
-  MAX_KEYS, USAGE_FILE_NAME, flushUsage, initUsage, readUsage, recordExpanded,
-  recordInjection, recordRetrieval, resetUsageState, usageFilePath, usageKey, usageLastError,
+  MAX_KEYS, MAX_PROJECTS_PER_ENTRY, MAX_PROJECT_KEYS, USAGE_FILE_NAME, flushUsage, initUsage,
+  readUsage, recordExpanded, recordInjection, recordQuery, recordRetrieval, resetUsageState,
+  usageFilePath, usageKey, usageLastError,
 } from '../lib/memory-usage.js'
 
 setLocale('zh')
@@ -205,6 +206,115 @@ test('上限常量与键数自洽（防未来把裁剪删掉）', () => {
   assert.equal(MAX_KEYS >= 1000, true, 'MAX_KEYS 必须是有限的正整数：' + MAX_KEYS)
   assert.equal(USAGE_FILE_NAME, 'usage.json')
   assert.equal(existsSync(join(tmpdir(), 'never-created-usage.json')), false)
+})
+
+test('定向查询事件：命中记 hits、零结果记 misses，每次都记 searches', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    const e = '[id:eeee5555] [2026-01-01] 网格交易的手续费口径'
+    recordQuery('memory', { results: [e], filter: '网格', project: 'projA' })
+    recordQuery('memory', { results: [], filter: '根本不存在的一个词', project: 'projA' })
+    assert.equal(flushUsage(), true)
+    const raw = usageOf(dir)
+    assert.equal(raw.projects.projA.searches, 2, '两次定向查询都要计 searches')
+    assert.equal(raw.projects.projA.misses, 1, '零结果必须记 miss')
+    assert.equal(raw.projects.projA.hits, 1)
+    assert.equal(raw.entries['memory#eeee5555'].hits, 1)
+    assert.ok(raw.projects.projA.lastSearch, 'lastSearch 要落盘')
+  } finally { clean(dir) }
+})
+
+test('项目分桶：同一批条目在不同项目下的注入/命中/展开分开计', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    const e = '[id:ffff6666] [2026-01-01] 复权口径定案'
+    recordInjection('memory', [e], { project: 'projA' })
+    recordInjection('memory', [e], { project: 'projB' })
+    recordInjection('memory', [e], { project: 'projB' })
+    recordExpanded('memory', e, { project: 'projB' })
+    flushUsage()
+    const raw = usageOf(dir)
+    const rec = raw.entries['memory#ffff6666']
+    assert.equal(rec.injects, 3, '总量仍照旧累加')
+    assert.equal(rec.byProject.projA.inj, 1)
+    assert.equal(rec.byProject.projB.inj, 2)
+    assert.equal(rec.byProject.projB.exp, 1)
+    assert.equal(raw.projects.projA.injects, 1)
+    assert.equal(raw.projects.projB.injects, 2)
+    assert.equal(raw.projects.projB.expanded, 1)
+  } finally { clean(dir) }
+})
+
+test('无会话 cwd 的调用落空项目桶，不污染具体项目', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    const e = '[id:aac07777] [2026-01-01] 无 cwd 场景'
+    recordInjection('memory', [e]) // 不传 ctx
+    flushUsage()
+    const raw = usageOf(dir)
+    assert.equal(raw.projects[''].injects, 1, '空项目桶承接无 cwd 调用')
+    assert.equal(raw.entries['memory#aac07777'].byProject[''], undefined, '空标签不写条目级分桶')
+  } finally { clean(dir) }
+})
+
+test('持久化往返：projects 与 byProject 重新载入不丢', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    recordQuery('memory', { results: [], filter: '查不到', project: 'projC' })
+    recordInjection('memory', ['[id:bbc08888] [2026-01-01] 条目'], { project: 'projC' })
+    flushUsage()
+    resetUsageState()
+    initUsage(dir)
+    const again = readUsage()
+    assert.equal(again.projects.projC.misses, 1)
+    assert.equal(again.projects.projC.searches, 1)
+    assert.equal(again.entries['memory#bbc08888'].byProject.projC.inj, 1)
+  } finally { clean(dir) }
+})
+
+test('向后兼容：旧格式（无 byProject/projects）可载入并继续记账', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    writeFileSync(join(dir, USAGE_FILE_NAME), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-10-25T00:00:00Z',
+      entries: { 'memory#ccc09999': { track: 'memory', hits: 2, expanded: 0, injects: 5, lastRetrieved: '', lastInjected: '', firstSeen: '2026-10-25T00:00:00Z' } },
+    }))
+    initUsage(dir)
+    assert.equal(readUsage().entries['memory#ccc09999'].hits, 2, '旧计数原样保留')
+    assert.deepEqual(readUsage().projects, {}, '旧文件没有项目聚合')
+    recordInjection('memory', ['[id:ccc09999] [2026-01-01] 旧格式条目'], { project: 'projD' })
+    flushUsage()
+    const raw = usageOf(dir)
+    assert.equal(raw.entries['memory#ccc09999'].injects, 6)
+    assert.equal(raw.entries['memory#ccc09999'].byProject.projD.inj, 1)
+    assert.equal(raw.projects.projD.injects, 1)
+  } finally { clean(dir) }
+})
+
+test('条目级项目桶有上限：超出归入 __other；项目聚合也有上限', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    const e = '[id:ddc00000] [2026-01-01] 上限测试'
+    for (let i = 0; i < MAX_PROJECTS_PER_ENTRY + 2; i++) recordInjection('memory', [e], { project: 'p' + i })
+    flushUsage()
+    const rec = usageOf(dir).entries['memory#ddc00000']
+    assert.equal(rec.injects, MAX_PROJECTS_PER_ENTRY + 2)
+    assert.ok(rec.byProject.__other, '超出上限的必须归入 __other')
+    assert.equal(Object.keys(rec.byProject).length <= MAX_PROJECTS_PER_ENTRY + 1, true, '键数受控：' + Object.keys(rec.byProject).join(','))
+    assert.ok(MAX_PROJECT_KEYS >= 8)
+  } finally { clean(dir) }
 })
 
 /** 最小 fake ctx（只提供 apply() 注册所需服务，与其它套件同款）。 */
