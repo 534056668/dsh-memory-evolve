@@ -9,7 +9,7 @@ import { extractEntryId, legacyIdFor } from '../lib/sync/entryid.js'
 import { apply } from '../lib/index.js'
 import {
   MAX_KEYS, MAX_PROJECTS_PER_ENTRY, MAX_PROJECT_KEYS, USAGE_FILE_NAME, flushUsage, initUsage,
-  readUsage, recordExpanded, recordInjection, recordQuery, recordRetrieval, resetUsageState,
+  readUsage, recordExpandMiss, recordExpanded, recordInjection, recordQuery, recordRetrieval, resetUsageState,
   usageFilePath, usageKey, usageLastError,
 } from '../lib/memory-usage.js'
 
@@ -314,6 +314,62 @@ test('条目级项目桶有上限：超出归入 __other；项目聚合也有上
     assert.ok(rec.byProject.__other, '超出上限的必须归入 __other')
     assert.equal(Object.keys(rec.byProject).length <= MAX_PROJECTS_PER_ENTRY + 1, true, '键数受控：' + Object.keys(rec.byProject).join(','))
     assert.ok(MAX_PROJECT_KEYS >= 8)
+  } finally { clean(dir) }
+})
+
+test('expand 未命中：expandMisses 分项目累计并落盘（这是降级安全性的真指标）', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    recordExpandMiss('memory', { project: 'projX' })
+    recordExpandMiss('memory', { project: 'projX' })
+    recordExpandMiss('key', { project: 'projY' })
+    assert.equal(flushUsage(), true)
+    const raw = usageOf(dir)
+    assert.equal(raw.projects.projX.expandMisses, 2)
+    assert.equal(raw.projects.projY.expandMisses, 1)
+    // 与 searches/misses 互不干扰
+    assert.equal(raw.projects.projX.searches || 0, 0)
+    assert.equal(raw.projects.projX.misses || 0, 0)
+    // 往返：重新载入不丢
+    resetUsageState()
+    initUsage(dir)
+    assert.equal(readUsage().projects.projX.expandMisses, 2)
+  } finally { clean(dir) }
+})
+
+test('expand 未命中（无 cwd）：进空项目桶，不污染具体项目', () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    initUsage(dir)
+    recordExpandMiss('memory')
+    flushUsage()
+    assert.equal(usageOf(dir).projects[''].expandMisses, 1)
+  } finally { clean(dir) }
+})
+
+test('工具层：expand 一个不存在的 id 会记一次 expandMisses', async () => {
+  const dir = tempDir()
+  try {
+    resetUsageState()
+    const ctx = fakeCtx()
+    apply(ctx, { memoryDir: dir })
+    const tool = ctx.state.tools.find((t) => t.name === 'memory')
+    const agent = { session: { header: { cwd: '/proj/expandmiss' } } }
+    const exec = () => ({ agent, callId: 'c1', signal: new AbortController().signal })
+    const store = new MemoryStore(dir)
+    store.add('memory', '一条真实存在的记忆', null)
+    const miss = await tool.execute({ action: 'expand', target: 'memory', id: 'deadbeef' }, exec())
+    assert.equal(miss.ok, false, '不存在的 id 必须返回失败')
+    assert.match(String(miss.message), /未找到|No entry/)
+    flushUsage()
+    const raw = usageOf(dir)
+    const project = Object.keys(raw.projects).find((k) => k !== '')
+    assert.ok(project, '必须记到某个项目桶：' + JSON.stringify(raw.projects))
+    assert.equal(raw.projects[project].expandMisses, 1)
+    assert.equal(raw.projects[project].expanded || 0, 0, '未命中的不能算成命中')
   } finally { clean(dir) }
 })
 
